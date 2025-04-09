@@ -1,0 +1,116 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using System.Text;
+using System.Security.Claims;
+using Microsoft.AspNetCore.Authorization;
+
+var builder = WebApplication.CreateBuilder(args);
+
+
+var configuration = builder.Configuration;
+var jwtSecret = configuration["Jwt:Secret"] ?? "segredo";
+
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseMySql(configuration.GetConnectionString("DefaultConnection"),
+        new MySqlServerVersion(new Version(8, 0, 34))));
+
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddJwtBearer(options =>
+    {
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidateIssuer = false,
+            ValidateAudience = false,
+            ValidateLifetime = true,
+            ValidateIssuerSigningKey = true,
+            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret))
+        };
+    });
+
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("AdminOnly", policy => policy.RequireClaim(ClaimTypes.Role, "admin"));
+});
+
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+var app = builder.Build();
+
+app.UseSwagger();
+app.UseSwaggerUI();
+
+app.UseAuthentication();
+app.UseAuthorization();
+
+// Registro
+app.MapPost("/register", async (UserDto userDto, AppDbContext db) =>
+{
+    if (await db.Users.AnyAsync(u => u.Username == userDto.Username))
+        return Results.BadRequest(new { error = "Nome de usuário já em uso" });
+
+    var hashedPassword = BCrypt.Net.BCrypt.HashPassword(userDto.Password);
+    var user = new User { Username = userDto.Username, Password = hashedPassword, Role = userDto.Role ?? "user" };
+
+    db.Users.Add(user);
+    await db.SaveChangesAsync();
+
+    return Results.Created("/login", new { message = "Usuário registrado com sucesso" });
+});
+
+// Login
+app.MapPost("/login", async (UserDto userDto, AppDbContext db) =>
+{
+    var user = await db.Users.FirstOrDefaultAsync(u => u.Username == userDto.Username);
+    if (user == null || !BCrypt.Net.BCrypt.Verify(userDto.Password, user.Password))
+        return Results.Unauthorized();
+
+    var claims = new[]
+    {
+        new Claim(ClaimTypes.Name, user.Username),
+        new Claim(ClaimTypes.Role, user.Role)
+    };
+
+    var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtSecret));
+    var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+    var token = new System.IdentityModel.Tokens.Jwt.JwtSecurityToken(
+        claims: claims,
+        expires: DateTime.UtcNow.AddHours(1),
+        signingCredentials: creds);
+
+    var tokenString = new System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler().WriteToken(token);
+
+    return Results.Ok(new { token = tokenString });
+});
+
+// Endpoints protegidos
+app.MapGet("/user", [Authorize] (ClaimsPrincipal user) =>
+{
+    return Results.Ok(new { message = $"Bem-vindo, usuário {user.Identity?.Name}" });
+});
+
+app.MapGet("/admin", [Authorize(Policy = "AdminOnly")] (ClaimsPrincipal user) =>
+{
+    return Results.Ok(new { message = $"Bem-vindo, administrador {user.Identity?.Name}" });
+});
+
+app.Run();
+
+// Modelos e Contexto
+record UserDto(string Username, string Password, string? Role);
+
+public class User
+{
+    public int Id { get; set; }
+    public string Username { get; set; } = string.Empty;
+    public string Password { get; set; } = string.Empty;
+    public string Role { get; set; } = "user";
+}
+
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+    public DbSet<User> Users => Set<User>();
+}
